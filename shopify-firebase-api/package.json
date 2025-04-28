@@ -1,0 +1,19 @@
+{
+    "name": "shopify-firebase-api",
+    "version": "1.0.0",
+    "description": "API for importing Shopify CSV to Firebase and retrieving product data",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js",
+        "dev": "nodemon index.js"
+    },
+    "dependencies": {
+        "csv-parser": "^3.2.0",
+        "express": "^4.21.2",
+        "firebase-admin": "^11.11.1",
+        "multer": "^1.4.5-lts.1"
+    },
+    "devDependencies": {
+        "nodemon": "^3.0.1"
+    }
+}

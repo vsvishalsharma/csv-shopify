@@ -1,46 +1,40 @@
 // shopify-firebase-api/index.js
 
 const express = require('express');
-const csv = require('csv-parser');
 const fs = require('fs');
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getFirestore } = require('firebase-admin/firestore');
+const path = require('path');
+require('dotenv').config();
+
+// Import Shopify API service
+const { productService, removeEmptyFields } = require('./shopify-api');
 
 // Initialize Express app
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Check if service account file exists
-if (!fs.existsSync('./firebase-service-account.json')) {
-  console.error('ERROR: firebase-service-account.json not found! Please create this file with your Firebase credentials.');
+// Check if .env file exists
+const envPath = path.join(__dirname, '.env');
+if (!fs.existsSync(envPath)) {
+  console.error('\n❌ ERROR: .env file not found');
+  console.error('Please run "node create-env.js" to create your environment file.');
   process.exit(1);
 }
 
-// Initialize Firebase with error handling and debugging
-let db;
-try {
-  const serviceAccount = require('./firebase-service-account.json');
-  
-  // Validate service account
-  if (!serviceAccount.project_id || !serviceAccount.client_email || !serviceAccount.private_key) {
-    console.error('ERROR: Service account is missing required fields (project_id, client_email, or private_key)!');
-    process.exit(1);
+// Check if Shopify credentials are configured
+const missingCredentials = [];
+['SHOPIFY_API_KEY', 'SHOPIFY_API_SECRET', 'SHOPIFY_SHOP_NAME', 'SHOPIFY_ACCESS_TOKEN'].forEach(key => {
+  if (!process.env[key]) {
+    missingCredentials.push(key);
   }
-  
-  console.log('Initializing Firebase with project ID:', serviceAccount.project_id);
-  
-  initializeApp({
-    credential: cert(serviceAccount)
-  });
-  
-  db = getFirestore();
-  console.log('Firebase initialized successfully');
-} catch (error) {
-  console.error('Error initializing Firebase:', error);
+});
+
+if (missingCredentials.length > 0) {
+  console.error(`\n❌ ERROR: Missing Shopify credentials: ${missingCredentials.join(', ')}`);
+  console.error('\nPlease update your .env file with the required credentials.');
+  console.error('You can run "node verify-credentials.js" to check your configuration.');
+  console.error('Or run "node create-env.js" to recreate your .env file.');
   process.exit(1);
 }
-
-const productsCollection = 'products';
 
 // Parse JSON bodies
 app.use(express.json());
@@ -54,25 +48,23 @@ app.get('/health', (req, res) => {
 app.get('/api/products', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 10;
-    const snapshot = await db.collection(productsCollection).limit(limit).get();
+    const products = await productService.getProducts({ limit });
     
-    if (snapshot.empty) {
+    if (!products || products.length === 0) {
       return res.json({ products: [] });
     }
     
-    const products = [];
-    snapshot.forEach(doc => {
-      const productData = doc.data();
+    const formattedProducts = products.map(product => {
       // Remove empty fields
-      const cleanedProduct = removeEmptyFields(productData);
+      const cleanedProduct = removeEmptyFields(product);
       
-      products.push({
-        id: doc.id,
+      return {
+        id: cleanedProduct.id.toString(),
         ...cleanedProduct
-      });
+      };
     });
     
-    res.json({ products });
+    res.json({ products: formattedProducts });
   } catch (error) {
     console.error('Error retrieving products:', error);
     res.status(500).json({ error: 'Internal server error', details: error.message });
@@ -82,16 +74,14 @@ app.get('/api/products', async (req, res) => {
 // API endpoint to fetch a product by ID
 app.get('/api/:id', async (req, res) => {
   try {
-    const docRef = db.collection(productsCollection).doc(req.params.id);
-    const doc = await docRef.get();
+    const product = await productService.getProduct(req.params.id);
 
-    if (!doc.exists) {
+    if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    const productData = doc.data();
     // Remove empty fields
-    const cleanedProduct = removeEmptyFields(productData);
+    const cleanedProduct = removeEmptyFields(product);
 
     res.json(cleanedProduct);
   } catch (error) {
@@ -113,19 +103,17 @@ app.post('/api/calculate-price', async (req, res) => {
       return res.status(400).json({ error: 'Valid width is required' });
     }
     
-    const docRef = db.collection(productsCollection).doc(productId);
-    const doc = await docRef.get();
+    const product = await productService.getProduct(productId);
 
-    if (!doc.exists) {
+    if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    const productData = doc.data();
     // Remove empty fields
-    const cleanedProduct = removeEmptyFields(productData);
+    const cleanedProduct = removeEmptyFields(product);
     
     // Apply pricing formula with width from request body
-    const processedProduct = applyPricingFormulaWithSize(cleanedProduct, parseFloat(width));
+    const processedProduct = productService.applyPricingFormula(cleanedProduct, parseFloat(width));
 
     res.json(processedProduct);
   } catch (error) {
@@ -134,299 +122,54 @@ app.post('/api/calculate-price', async (req, res) => {
   }
 });
 
-// Function to remove empty fields from an object
-function removeEmptyFields(obj) {
-  const cleanedObj = {};
-  
-  for (const key in obj) {
-    const value = obj[key];
-    // Skip empty strings, null, or undefined values
-    if (value === null || value === undefined || value === '') {
-      continue;
-    }
-    
-    // If it's an object, recursively clean it
-    if (typeof value === 'object' && !Array.isArray(value)) {
-      cleanedObj[key] = removeEmptyFields(value);
-    } else {
-      cleanedObj[key] = value;
-    }
-  }
-  
-  return cleanedObj;
-}
-
-// Function to apply pricing formula based on product type
-function applyPricingFormula(product) {
-  // Clone the product to avoid modifying the original
-  const processedProduct = { ...product };
-  
-  // Get product type and dimensions (if available)
-  const productType = (product.Type || product.ProductType || '').toLowerCase();
-  const width = parseFloat(product.Width || 0);
-  
-  // Base price from the product (if available)
-  let basePrice = parseFloat(product.Price || product.price || 0);
-  
-  // Apply formula for Sofas (every 10cm increase = 200 shekels)
-  if (productType.includes('sofa') && !productType.includes('corner') && width > 0) {
-    // Calculate price adjustment based on width (every 10cm = 200 shekels)
-    const standardWidth = 100; // Assume this is the base width for pricing
-    const widthDifference = width - standardWidth;
-    
-    if (widthDifference > 0) {
-      const priceIncrease = Math.ceil(widthDifference / 10) * 200;
-      basePrice += priceIncrease;
-    }
-  }
-  
-  // Apply formula for TV Stands (every 10cm increase = 150 shekels)
-  if ((productType.includes('tv') && productType.includes('stand')) && width > 0) {
-    // Calculate price adjustment based on width (every 10cm = 150 shekels)
-    const standardWidth = 100; // Assume this is the base width for pricing
-    const widthDifference = width - standardWidth;
-    
-    if (widthDifference > 0) {
-      const priceIncrease = Math.ceil(widthDifference / 10) * 150;
-      basePrice += priceIncrease;
-    }
-  }
-  
-  // Update the product price
-  if (product.Price !== undefined) {
-    processedProduct.Price = basePrice.toString();
-  }
-  if (product.price !== undefined) {
-    processedProduct.price = basePrice;
-  }
-  
-  return processedProduct;
-}
-
-// Function to apply pricing formula with custom size
-function applyPricingFormulaWithSize(product, width) {
-  // Clone the product to avoid modifying the original
-  const processedProduct = { ...product };
-  
-  // Get product type
-  const productType = (product.Type || product.ProductType || '').toLowerCase();
-  
-  // Base price from the product (if available)
-  let basePrice = parseFloat(product.Price || product.price || 0);
-  
-  // Apply formula for Sofas (every 10cm increase = 200 shekels)
-  if (productType.includes('sofa') && !productType.includes('corner') && width > 0) {
-    // Calculate price adjustment based on width (every 10cm = 200 shekels)
-    const standardWidth = 100; // Assume this is the base width for pricing
-    const widthDifference = width - standardWidth;
-    
-    if (widthDifference > 0) {
-      const priceIncrease = Math.ceil(widthDifference / 10) * 200;
-      basePrice += priceIncrease;
-    }
-  }
-  
-  // Apply formula for TV Stands (every 10cm increase = 150 shekels)
-  if ((productType.includes('tv') && productType.includes('stand')) && width > 0) {
-    // Calculate price adjustment based on width (every 10cm = 150 shekels)
-    const standardWidth = 100; // Assume this is the base width for pricing
-    const widthDifference = width - standardWidth;
-    
-    if (widthDifference > 0) {
-      const priceIncrease = Math.ceil(widthDifference / 10) * 150;
-      basePrice += priceIncrease;
-    }
-  }
-  
-  // Update the product price
-  if (product.Price !== undefined) {
-    processedProduct.Price = basePrice.toString();
-  }
-  if (product.price !== undefined) {
-    processedProduct.price = basePrice;
-  }
-  
-  // Add calculated width to response
-  processedProduct.calculatedWidth = width;
-  
-  return processedProduct;
-}
-
-// Function to generate a safe document ID
-function generateSafeId(input) {
-  if (!input) {
-    return `product-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-  }
-  
-  // Convert to string and remove invalid characters
-  return input.toString()
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-') // Replace non-alphanumeric with hyphens
-    .replace(/-+/g, '-') // Replace multiple hyphens with single hyphen
-    .replace(/^-|-$/g, '') // Remove leading/trailing hyphens
-    .substring(0, 1500); // Ensure ID isn't too long
-}
-
-// Function to verify Firestore connection
-async function verifyFirestoreConnection() {
+// API endpoint to search products
+app.get('/api/search/products', async (req, res) => {
   try {
-    console.log('Testing Firestore connection...');
-    const testCollection = 'test_collection';
-    const testDoc = 'test_connection';
+    const { query, limit } = req.query;
     
-    await db.collection(testCollection).doc(testDoc).set({ 
-      test: true, 
-      timestamp: new Date().toISOString() 
+    if (!query) {
+      return res.status(400).json({ error: 'Search query is required' });
+    }
+    
+    const limitValue = parseInt(limit) || 10;
+    const products = await productService.searchProducts(query, { limit: limitValue });
+    
+    if (!products || products.length === 0) {
+      return res.json({ products: [] });
+    }
+    
+    const formattedProducts = products.map(product => {
+      // Remove empty fields
+      const cleanedProduct = removeEmptyFields(product);
+      
+      return {
+        id: cleanedProduct.id.toString(),
+        ...cleanedProduct
+      };
     });
     
-    await db.collection(testCollection).doc(testDoc).delete();
-    console.log('✅ Firestore connection verified');
-    return true;
+    res.json({ products: formattedProducts });
   } catch (error) {
-    console.error('❌ Firestore connection test failed:', error);
-    return false;
+    console.error('Error searching products:', error);
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
-}
-
-// Function to import CSV data to Firebase
-async function importCsvToFirebase() {
-    const products = [];
-    const csvFilePath = './products.csv';
-    
-    // Check if file exists
-    if (!fs.existsSync(csvFilePath)) {
-      console.error('Error: products.csv file not found in project root');
-      return 0;
-    }
-    
-    // Verify Firebase connection before starting import
-    const connectionOk = await verifyFirestoreConnection();
-    if (!connectionOk) {
-      throw new Error('Failed to connect to Firestore. Please check your service account credentials and permissions.');
-    }
-    
-    console.log('Starting CSV import process...');
-    
-    return new Promise((resolve, reject) => {
-      fs.createReadStream(csvFilePath)
-        .pipe(csv())
-        .on('data', (row) => {
-          // Generate a safe product ID
-          const productId = generateSafeId(row['ID'] || row['Handle']);
-          
-          products.push({
-            id: productId,
-            ...row
-          });
-        })
-        .on('end', async () => {
-          try {
-            console.log(`Parsed ${products.length} products from CSV`);
-            
-            // Use individual document writes instead of batching
-            let successCount = 0;
-            let failureCount = 0;
-            
-            // Process in very small chunks to avoid rate limits
-            const chunkSize = 10;
-            
-            for (let i = 0; i < products.length; i += chunkSize) {
-              const chunk = products.slice(i, i + chunkSize);
-              console.log(`Processing chunk ${Math.floor(i/chunkSize) + 1} of ${Math.ceil(products.length/chunkSize)}, size: ${chunk.length}`);
-              
-              // Process documents sequentially to avoid overloading Firestore
-              for (const product of chunk) {
-                try {
-                  const docRef = db.collection(productsCollection).doc(product.id);
-                  await docRef.set(product);
-                  successCount++;
-                  
-                  if (successCount % 10 === 0 || successCount === 1) {
-                    console.log(`Progress: ${successCount}/${products.length} products saved`);
-                  }
-                } catch (error) {
-                  failureCount++;
-                  console.error(`Failed to upload product ${product.id}:`, error.message);
-                }
-              }
-              
-              // Add a longer delay between chunks to prevent rate limiting
-              await new Promise(resolve => setTimeout(resolve, 1000));
-            }
-            
-            console.log(`CSV import completed: ${successCount} successful, ${failureCount} failed`);
-            resolve(successCount);
-          } catch (error) {
-            console.error('Error uploading to Firebase:', error);
-            reject(error);
-          }
-        })
-        .on('error', (error) => {
-          console.error('Error processing CSV:', error);
-          reject(error);
-        });
-    });
-}
-
-// API endpoint to trigger CSV import
-app.post('/api/import-csv', async (req, res) => {
-  try {
-    // Check if already importing
-    if (global.isImporting) {
-      return res.status(409).json({ error: 'Import already in progress' });
-    }
-    
-    // Set flag to prevent multiple imports
-    global.isImporting = true;
-    
-    // Start import in background
-    importCsvToFirebase()
-      .then(count => {
-        console.log(`Import completed: ${count} products imported`);
-        global.isImporting = false;
-      })
-      .catch(error => {
-        console.error('Import failed:', error);
-        global.isImporting = false;
-      });
-    
-    // Respond immediately
-    res.json({ 
-      message: 'CSV import started',
-      status: 'processing'
-    });
-  } catch (error) {
-    global.isImporting = false;
-    console.error('Error starting import:', error);
-    res.status(500).json({ error: 'Failed to start import', details: error.message });
-  }
-});
-
-// API endpoint to check import status
-app.get('/api/import-status', (req, res) => {
-  res.json({
-    importing: !!global.isImporting,
-    status: global.isImporting ? 'in_progress' : 'idle'
-  });
 });
 
 // Start the server
-app.listen(port, async () => {
-  console.log(`Server running at http://localhost:${port}`);
-  console.log(`- Health check: http://localhost:${port}/health`);
-  console.log(`- List products: http://localhost:${port}/api/products`);
-  console.log(`- Get product by ID: http://localhost:${port}/api/{id}`);
-  console.log(`- Import CSV: POST http://localhost:${port}/api/import-csv`);
-  console.log(`- Import status: GET http://localhost:${port}/api/import-status`);
+app.listen(port, () => {
+  const shopName = process.env.SHOPIFY_SHOP_NAME.replace('.myshopify.com', '');
   
-  // Check if command line argument to import CSV is provided
-  if (process.argv.includes('--import-csv')) {
-    console.log('Auto-import flag detected. Starting CSV import...');
-    try {
-      const importedCount = await importCsvToFirebase();
-      console.log(`Successfully imported ${importedCount} products to Firebase`);
-    } catch (error) {
-      console.error('Failed to import products:', error);
-    }
-  }
+  console.log('┌─────────────────────────────────────────────────┐');
+  console.log('│           Shopify API Server Running            │');
+  console.log('├─────────────────────────────────────────────────┤');
+  console.log(`│ Server URL: http://localhost:${port}              │`);
+  console.log(`│ Shop: ${shopName.padEnd(41, ' ')}│`);
+  console.log('├─────────────────────────────────────────────────┤');
+  console.log('│ Available Endpoints:                            │');
+  console.log('│ • GET  /health                                  │');
+  console.log('│ • GET  /api/products                            │');
+  console.log('│ • GET  /api/:id                                 │');
+  console.log('│ • POST /api/calculate-price                     │');
+  console.log('│ • GET  /api/search/products                     │');
+  console.log('└─────────────────────────────────────────────────┘');
 });

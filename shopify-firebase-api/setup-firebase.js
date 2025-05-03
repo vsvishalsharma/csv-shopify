@@ -109,7 +109,7 @@ async function setupFirebase() {
       
       console.log('\n✅ Firebase setup completed successfully!');
       console.log('You can now run your application:');
-      console.log('$ node index.js');
+      console.log('$ node server.js');
       
       return true;
     } catch (error) {

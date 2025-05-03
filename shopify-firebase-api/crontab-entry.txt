@@ -1,0 +1,1 @@
+0 2 * * 0 C:\nvm4w\nodejs\node.exe C:\Users\91941\Desktop\csv-firebase\csv-shopify\shopify-firebase-api\scheduled-sync.js >> C:\Users\91941\Desktop\csv-firebase\csv-shopify\shopify-firebase-api\sync-log.txt 2>&1
